@@ -1,0 +1,46 @@
+api:
+  rest_base_url: https://api.massive.com
+  max_retries: 5
+  retry_backoff_base_seconds: 1.0
+  retry_backoff_max_seconds: 60.0
+  request_timeout_seconds: 30
+  max_concurrent_requests: 3
+  page_limit: 50000
+
+storage:
+  data_dir: ~/market_data
+  parquet_compression: zstd
+  parquet_row_group_size: 100000
+
+ingest:
+  stocks:
+    source: wiki_scrape
+    indexes: [SP500, NDX]
+    refresh_interval_days: 7
+  futures:
+    product_codes: [ES, NQ, RTY, YM, CL, NG, GC, SI, ZN, ZB, 6E, 6J]
+    discover_contracts: true
+    min_first_trade_date: "2022-01-01"
+  crypto:
+    symbols: [BTC, ETH]
+    quote_currency: USD
+  extended_hours: true
+  adjusted_for_splits_at_fetch: false
+
+defaults:
+  stocks_daily_start: "2005-01-01"
+  stocks_minute_start: "2020-01-01"
+  crypto_start: "2018-01-01"
+  futures_minute_start: "2022-01-01"
+  futures_daily_start: "2010-01-01"
+
+validation:
+  on_zero_bars_open_market: warn
+  on_ohlc_violation: warn
+  on_duplicate_timestamp: keep_first
+
+logging:
+  console_level: INFO
+  file_level: DEBUG
+  file_max_bytes: 10485760
+  file_backup_count: 5
