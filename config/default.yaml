@@ -1,8 +1,6 @@
 api:
   rest_base_url: https://api.massive.com
   max_retries: 5
-  retry_backoff_base_seconds: 1.0
-  retry_backoff_max_seconds: 60.0
   request_timeout_seconds: 30
   max_concurrent_requests: 3
   page_limit: 50000

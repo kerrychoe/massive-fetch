@@ -413,4 +413,23 @@ The goal of this whole project is to **test more strategy ideas faster**, not to
 
 ---
 
+## Slice 1 — REST client: retry ownership (Option B)
+
+SDK discovery (recorded in `SDK_NOTES.md`) found the `massive` SDK already implements
+retry itself: a `urllib3.util.Retry` with `status_forcelist=[413,429,499,500,502,503,504]`,
+`backoff_factor=0.1`, and `Retry-After` handling. SPEC §7.2's bespoke `tenacity` policy
+(base=1.0s/max=60s/jitter) was written *before* we'd seen the SDK — it was aspirational.
+
+**Decision (with outside reviewer): Option B — the SDK owns retry.** The wrapper adds
+only asyncio concurrency limiting (semaphore, default 3, bridging the sync SDK via a
+thread pool), structured per-call logging, and typed exception mapping
+(`MassiveAuthError` / `MassiveBadRequest` / `MassiveRetriesExhausted`). Layering our own
+tenacity on top would double-retry; rejected. The SDK constructor exposes only attempt
+count (`retries`, from `APIConfig.max_retries`) and timeouts — not the backoff curve — so
+the inert `retry_backoff_base_seconds` / `retry_backoff_max_seconds` fields were removed
+from `APIConfig` and `default.yaml`. SPEC §7.2 was rewritten to document the SDK's actual
+behavior and §4.2 amended for the field removal.
+
+---
+
 End of design log.

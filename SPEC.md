@@ -151,12 +151,14 @@ from pydantic import BaseModel, Field, field_validator
 
 class APIConfig(BaseModel):
     rest_base_url: str = "https://api.massive.com"
-    max_retries: int = 5
-    retry_backoff_base_seconds: float = 1.0
-    retry_backoff_max_seconds: float = 60.0
+    max_retries: int = 5                    # -> SDK RESTClient(retries=...); see §7.2
     request_timeout_seconds: int = 30
     max_concurrent_requests: int = 3        # conservative default
     page_limit: int = 50000                 # max per Massive aggregates endpoint
+
+# NOTE (Slice 1): retry_backoff_base_seconds / retry_backoff_max_seconds were
+# removed. The SDK owns retry with a fixed urllib3 backoff that the constructor
+# does not expose, so those fields could never be wired. See §7.2.
 
 class StorageConfig(BaseModel):
     data_dir: Path = Path("~/market_data").expanduser()
@@ -218,8 +220,6 @@ class AppConfig(BaseModel):
 api:
   rest_base_url: https://api.massive.com
   max_retries: 5
-  retry_backoff_base_seconds: 1.0
-  retry_backoff_max_seconds: 60.0
   request_timeout_seconds: 30
   max_concurrent_requests: 3
   page_limit: 50000
@@ -540,18 +540,32 @@ CREATE INDEX IF NOT EXISTS idx_run_log_started ON run_log(started_at DESC);
 
 ## 7. REST Client (`src/massive_fetch/clients/rest.py`)
 
-A thin wrapper over `massive-com/client-python` with:
+A thin async facade over the synchronous `massive` SDK (`massive-com/client-python`).
+The SDK owns retry; this wrapper adds exactly three things (see `SDK_NOTES.md` for
+the discovery that drove this):
 
-- Concurrency-limited execution (semaphore, default 3).
-- Retry on transient failures (429, 5xx, network errors) with exponential backoff using `tenacity`.
-- Structured logging of every call.
-- A clean async interface even if the SDK is sync (run sync calls in a thread pool).
+- Concurrency-limited execution (`asyncio.Semaphore`, default 3) bridging the sync
+  SDK through a thread pool.
+- Structured logging of every call (§11).
+- Typed exception mapping (§7.2). The wrapper never swallows errors.
 
 ### 7.1 Public interface
 
+`Aggregate` is the SDK's `Agg` model, re-exported — the wrapper yields it unchanged
+and leaves canonical normalization to `transform/normalize.py` (Slice 2+).
+
 ```python
+# Typed exception hierarchy (see §7.2)
+class MassiveClientError(Exception): ...        # base — callers catch this
+class MassiveAuthError(MassiveClientError): ...        # wraps SDK AuthError (construction only)
+class MassiveBadRequest(MassiveClientError): ...       # wraps SDK BadResponse (never retryable)
+class MassiveRetriesExhausted(MassiveClientError): ... # wraps urllib3 MaxRetryError/HTTPError
+
 class MassiveRESTClient:
     def __init__(self, api_key: str, config: APIConfig, logger): ...
+    async def __aenter__(self) -> "MassiveRESTClient": ...
+    async def __aexit__(self, *exc) -> None: ...
+    async def aclose(self) -> None: ...         # shuts down the thread pool
 
     async def list_aggs(
         self,
@@ -560,50 +574,60 @@ class MassiveRESTClient:
         timespan: Literal["minute", "day"],
         from_date: str,         # 'YYYY-MM-DD'
         to_date: str,           # 'YYYY-MM-DD'
-        adjusted: bool = False,
+        adjusted: bool = False, # RAW per §6.1 (SDK default is True — we override)
         sort: Literal["asc", "desc"] = "asc",
     ) -> AsyncIterator[Aggregate]: ...
-
-    async def list_futures_contracts(
-        self,
-        product_code: str,
-        as_of: str | None = None,
-    ) -> AsyncIterator[FuturesContract]: ...
-
-    async def list_splits(
-        self, ticker: str | None = None, ...
-    ) -> AsyncIterator[Split]: ...
-
-    async def list_dividends(
-        self, ticker: str | None = None, ...
-    ) -> AsyncIterator[Dividend]: ...
 ```
+
+**Deferred to their own slices** (same thread-pool bridge, not built in Slice 1):
+`list_splits` / `list_dividends` (Slice 7) and `list_futures_contracts` (Slice 8 —
+note futures *bars* use the SDK's separate `list_futures_aggregates`, not `list_aggs`).
 
 ### 7.2 Retry policy
 
-- Retry on: HTTP 429, 500, 502, 503, 504, connection errors, timeouts.
-- Do NOT retry on: 400, 401, 403, 404 (clearly bad request — log and surface).
-- Backoff: exponential with jitter — `min(base * 2**attempt + random(), max)`. Defaults: base=1.0s, max=60s.
-- Max attempts: 5 (configurable).
-- After max attempts, raise a typed exception (`MassiveRetriesExhausted`) and bubble up; the caller decides whether to skip the symbol or abort the whole job.
+**Retry is owned by the SDK, not by this wrapper.** `massive-com/client-python`
+configures a `urllib3.util.Retry` internally with:
+
+- `status_forcelist = [413, 429, 499, 500, 502, 503, 504]`,
+- `backoff_factor = 0.1` (→ 0.2s, 0.4s, 0.8s, 1.6s …),
+- `Retry-After` honored for 413/429/503,
+- connection/timeout errors covered, and
+- total attempts = the SDK's `retries` argument, which we set from `APIConfig.max_retries`.
+
+The wrapper adds **no** retry layer (avoiding double-retry). Only the attempt count
+and request timeouts are configurable through the SDK constructor; the forcelist and
+backoff curve are fixed by the SDK. Consequently the former
+`retry_backoff_base_seconds` / `retry_backoff_max_seconds` config fields were removed
+(§4.2) — they could not alter the SDK's fixed backoff.
+
+When the SDK exhausts its retries it raises `urllib3.exceptions.MaxRetryError`, mapped
+to **`MassiveRetriesExhausted`** and re-raised. Non-retryable responses
+(400/401/403/404) surface from the SDK as `BadResponse`, mapped to
+**`MassiveBadRequest`** (never retried). Construction with a missing key raises the
+SDK's `AuthError`, mapped to **`MassiveAuthError`**. The wrapper never swallows these
+— the caller decides whether to skip the symbol or abort the job. (A bad ticker is not
+an error: the SDK returns an empty result, which the wrapper passes through.)
+
+*Rationale: the pre-implementation version of this section specified a bespoke
+`tenacity` policy (base=1.0s/max=60s/jitter). SDK discovery showed the SDK already
+implements urllib3-based retry with `Retry-After` handling; that earlier policy was
+aspirational. We accept the SDK's behavior and add only the layer above.*
 
 ### 7.3 Rate limiting
 
-- A single `asyncio.Semaphore(max_concurrent_requests)` gates all outbound calls.
-- On 429, honor `Retry-After` header if present; otherwise use backoff schedule.
+- A single `asyncio.Semaphore(max_concurrent_requests)` gates all outbound calls; it
+  is held only across the (blocking, thread-pooled) fetch, released before results are
+  yielded.
+- `Retry-After` on 429 is handled inside the SDK's urllib3 `Retry` (see §7.2).
 
 ### 7.4 Concurrency model
 
-The SDK's `list_aggs` is a generator that paginates internally. Wrap it in a worker-pool pattern:
-
-```python
-async def fetch_many(symbols: list[str], fetch_fn) -> dict[str, Result]:
-    sem = asyncio.Semaphore(config.api.max_concurrent_requests)
-    async def bounded(s):
-        async with sem:
-            return await fetch_fn(s)
-    return await asyncio.gather(*[bounded(s) for s in symbols], return_exceptions=True)
-```
+The SDK's `list_aggs` is a sync generator that paginates internally. The wrapper
+materializes the full page-walk in a worker thread (`run_in_executor`, pool sized to
+`max_concurrent_requests`) under the semaphore, then yields. A `fetch_many` worker-pool
+helper for fanning out across symbols is deferred to Slice 2, where the first call site
+(crypto ingestion) appears; since the semaphore lives inside the client, any
+`asyncio.gather` over client calls is already concurrency-bounded.
 
 ---
 

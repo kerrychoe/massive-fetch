@@ -21,9 +21,7 @@ from pydantic import BaseModel, field_validator
 
 class APIConfig(BaseModel):
     rest_base_url: str = "https://api.massive.com"
-    max_retries: int = 5
-    retry_backoff_base_seconds: float = 1.0
-    retry_backoff_max_seconds: float = 60.0
+    max_retries: int = 5                    # -> SDK RESTClient(retries=...); see SPEC §7.2
     request_timeout_seconds: int = 30
     max_concurrent_requests: int = 3        # conservative default
     page_limit: int = 50000                 # max per Massive aggregates endpoint
