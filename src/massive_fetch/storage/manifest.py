@@ -1,7 +1,7 @@
 """SQLite manifest — tracks ingestion progress (SPEC §6.3).
 
-Slice 0 creates the schema and reports emptiness. Read/write of ingestion
-state arrives in Slice 2.
+Slice 0 creates the schema and reports emptiness. Slice 2 adds read/write of
+ingestion state (``get_state`` / ``upsert_state``).
 
 The manifest is always a true local file path: SQLite cannot run over object
 storage, so it is configured separately from the data ``StorageBackend`` (§6.0.1).
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ingestion_state (
@@ -63,3 +64,61 @@ class Manifest:
         if not self.path.exists():
             return True
         return self.tracked_series_count() == 0
+
+    # -- ingestion_state read/write (Slice 2) -------------------------------
+
+    def get_state(
+        self, asset_class: str, symbol: str, timeframe: str
+    ) -> dict[str, Any] | None:
+        """Return the ``ingestion_state`` row for a series, or ``None`` if absent."""
+        if not self.path.exists():
+            return None
+        with sqlite3.connect(self.path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM ingestion_state "
+                "WHERE asset_class = ? AND symbol = ? AND timeframe = ?",
+                (asset_class, symbol, timeframe),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def upsert_state(
+        self,
+        asset_class: str,
+        symbol: str,
+        timeframe: str,
+        *,
+        earliest_date: str,
+        last_complete_date: str,
+        bar_count: int,
+        last_updated_at: str,
+    ) -> None:
+        """Insert or update one series' state in a single transaction.
+
+        Called *after* the Parquet commit (write-then-record, SPEC §8): if the
+        data write fails the manifest is never advanced, so a rerun retries the
+        symbol; a stale manifest is corrected on the next run via append+dedupe.
+        """
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                """
+                INSERT INTO ingestion_state
+                    (asset_class, symbol, timeframe,
+                     earliest_date, last_complete_date, last_updated_at, bar_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(asset_class, symbol, timeframe) DO UPDATE SET
+                    earliest_date      = excluded.earliest_date,
+                    last_complete_date = excluded.last_complete_date,
+                    last_updated_at    = excluded.last_updated_at,
+                    bar_count          = excluded.bar_count
+                """,
+                (
+                    asset_class,
+                    symbol,
+                    timeframe,
+                    earliest_date,
+                    last_complete_date,
+                    last_updated_at,
+                    bar_count,
+                ),
+            )

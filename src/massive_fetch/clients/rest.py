@@ -21,8 +21,9 @@ from __future__ import annotations
 import asyncio
 import time
 import weakref
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Literal
 
 import structlog
@@ -59,6 +60,22 @@ class MassiveBadRequest(MassiveClientError):
 class MassiveRetriesExhausted(MassiveClientError):
     """Transient failure (429/5xx/network/timeout) the SDK already retried and
     gave up on. Wraps urllib3 ``MaxRetryError`` / ``HTTPError``."""
+
+
+# --- Multi-symbol fan-out spec (SPEC §7.4) ---------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class AggsRequest:
+    """One ``list_aggs`` call, for fanning out across symbols via ``fetch_many``."""
+
+    ticker: str
+    multiplier: int
+    timespan: Literal["minute", "day"]
+    from_date: str  # 'YYYY-MM-DD'
+    to_date: str  # 'YYYY-MM-DD'
+    adjusted: bool = False  # RAW per SPEC §6.1
+    sort: Literal["asc", "desc"] = "asc"
 
 
 # --- Client ----------------------------------------------------------------
@@ -191,6 +208,42 @@ class MassiveRESTClient:
                 limit=self._config.page_limit,
             )
         )
+
+    async def fetch_many(
+        self, requests: Iterable[AggsRequest]
+    ) -> dict[str, list[Aggregate] | Exception]:
+        """Fan out ``list_aggs`` across many tickers; return per-ticker results.
+
+        Concurrency is bounded by this client's **existing** semaphore — every
+        ``list_aggs`` acquires it — so no second semaphore is introduced (SPEC
+        §7.4: "any ``asyncio.gather`` over client calls is already
+        concurrency-bounded"). Effective parallelism is ``max_concurrent_requests``.
+
+        Per-symbol errors are **captured, not raised**: each value is either the
+        materialized list of bars or the exception that occurred. The caller
+        decides what to do per result (skip the symbol, abort the run, …). If two
+        requests share a ticker, the later one wins in the returned mapping.
+        """
+        reqs = list(requests)
+
+        async def _collect(req: AggsRequest) -> list[Aggregate]:
+            return [
+                bar
+                async for bar in self.list_aggs(
+                    req.ticker,
+                    req.multiplier,
+                    req.timespan,
+                    req.from_date,
+                    req.to_date,
+                    adjusted=req.adjusted,
+                    sort=req.sort,
+                )
+            ]
+
+        results = await asyncio.gather(
+            *(_collect(r) for r in reqs), return_exceptions=True
+        )
+        return dict(zip((r.ticker for r in reqs), results))
 
     # -- logging helpers ----------------------------------------------------
 

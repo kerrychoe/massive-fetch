@@ -17,19 +17,28 @@ FIXTURES = Path(__file__).parent / "fixtures"
 class RecordingLogger:
     """Minimal stand-in for a structlog BoundLogger that records calls.
 
-    The wrapper only ever calls ``.debug()`` / ``.error()`` with an event name
-    and keyword fields, so this captures everything we need to assert on without
-    depending on structlog's global configuration.
+    The REST wrapper uses ``.debug()`` / ``.error()``; the ingestion layer also
+    uses ``.info()`` / ``.warning()``. This captures all four with an event name
+    and keyword fields, without depending on structlog's global configuration.
     """
 
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
 
+    def _record(self, level: str, event: str, **kw: Any) -> None:
+        self.events.append({"level": level, "event": event, **kw})
+
     def debug(self, event: str, **kw: Any) -> None:
-        self.events.append({"level": "debug", "event": event, **kw})
+        self._record("debug", event, **kw)
+
+    def info(self, event: str, **kw: Any) -> None:
+        self._record("info", event, **kw)
+
+    def warning(self, event: str, **kw: Any) -> None:
+        self._record("warning", event, **kw)
 
     def error(self, event: str, **kw: Any) -> None:
-        self.events.append({"level": "error", "event": event, **kw})
+        self._record("error", event, **kw)
 
 
 @pytest.fixture
