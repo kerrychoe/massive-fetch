@@ -463,12 +463,12 @@ All OHLCV files share this schema, stored with `zstd` compression:
 | Column | Arrow type | Notes |
 |---|---|---|
 | `timestamp` | `timestamp[ns, tz="UTC"]` | UTC, nanosecond precision. Convert at read time for display. |
-| `symbol` | `dictionary<int32, string>` | The instrument ticker as passed to Massive. |
+| `symbol` | `dictionary<string>` | The instrument ticker as passed to Massive. Index width unpinned — Polars writes uint32; readers handle either. |
 | `open` | `float64` | |
 | `high` | `float64` | |
 | `low` | `float64` | |
 | `close` | `float64` | |
-| `volume` | `int64` | |
+| `volume` | `float64` | Raw SDK value is fractional (fractional-share / crypto volume); stored as float64 to avoid lossy truncation. |
 | `vwap` | `float64` | Nullable; absent for some asset classes. |
 | `transactions` | `int32` | Nullable. |
 | `otc` | `bool` | Stocks only; nullable elsewhere. |

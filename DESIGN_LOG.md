@@ -432,4 +432,32 @@ behavior and §4.2 amended for the field removal.
 
 ---
 
+## Slice 2 — Crypto ingestion: canonical schema amendments (§6.1)
+
+Slice 2 (crypto daily ingestion) is the first slice to *materialize* the canonical
+§6.1 Parquet schema, via `transform/normalize.py`. Two corrections to §6.1 were made
+before writing any normalization code (with the outside reviewer), so the schema the
+data is written against is right the first time.
+
+**1. `volume`: `int64` → `float64`.** SDK discovery (`SDK_NOTES.md` §3) and the
+committed test fixture both show the SDK returns `volume` as a *fractional* float
+(e.g. `25370.68`), and crypto / fractional-share volumes are routinely non-integer.
+Casting to `int64` would silently truncate real data; storing `float64` preserves the
+raw value losslessly. This is consistent with the project's stated non-goal of not
+modifying or "cleaning" data beyond schema normalization (§1). A precondition entering
+the slice asserted this had already been committed as `float64`; it had not — the spec
+still read `int64` and no such commit existed in git history — so the change is made
+here explicitly.
+
+**2. `symbol`: `dictionary<int32, string>` → `dictionary<string>`.** The index-width
+pin (`int32`) bought nothing: Polars writes Categorical columns with **uint32**
+dictionary indices, and Parquet readers handle either width transparently. Pinning
+`int32` would have forced an explicit pyarrow schema rewrite on every write for no
+functional gain. Dropping the pin keeps the dictionary-encoding intent (compact,
+repeated ticker strings) while letting the writer use its natural index type.
+
+Both are the only §6.1 changes; `normalize.py` enforces the amended schema downstream.
+
+---
+
 End of design log.
