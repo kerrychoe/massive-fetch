@@ -1,8 +1,26 @@
-"""Crypto daily ingestion (SPEC §8.3, §13 Slice 2).
+"""Crypto ingestion — daily and minute (SPEC §8.3, §13 Slice 2 + Slice 3).
 
-Fetches daily OHLCV bars for the configured crypto symbols through the REST
-client, normalizes to the canonical §6.1 schema, appends to a per-symbol Parquet
-via the storage backend, then records progress in the manifest.
+Fetches OHLCV bars for the configured crypto symbols through the REST client,
+normalizes to the canonical §6.1 schema, appends to per-symbol Parquet via the
+storage backend, then records progress in the manifest.
+
+A single timeframe-aware core (``ingest_crypto``) drives both timeframes; only the
+write+record step differs (SPEC §6):
+
+- **daily** — one file per symbol (``crypto_daily_key``), full history.
+- **minute** — year-partitioned per symbol (``crypto_minute_key(symbol, year)``,
+  ``ohlcv/crypto/minute/{SYMBOL}/{YYYY}.parquet``). One fetch covers the whole
+  range; the SDK paginates; the normalized frame is split by UTC year and each
+  year is appended to its ``{YYYY}.parquet`` (read-merge-write + dedupe). The
+  single manifest row is recorded once, after every year file is committed.
+
+Resumability (SPEC §6.3) is identical for both: resume from
+``last_complete_date + 1 day``. Because ``target_end`` is always a complete past
+UTC day (yesterday), the recorded ``last_complete_date`` is always a fully-present
+day, so ``+1`` never skips an un-fetched bar. The one crash window — between the
+Parquet commit and the manifest upsert (disk holds more than the manifest knows)
+— is healed dupe-free on rerun by ``append_parquet``'s dedupe on
+``(symbol, timestamp)`` at minute (nanosecond) precision.
 
 Crypto trades 24/7, so there is no market calendar and "yesterday" is measured in
 **UTC**, not ET (SPEC §8.3). Two identifiers per symbol: the bare symbol (``BTC``)
@@ -12,6 +30,7 @@ the ``symbol`` column value, and the manifest key (SPEC §5.3, §6.1, §6.3).
 
 from __future__ import annotations
 
+import posixpath
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
@@ -31,7 +50,9 @@ from massive_fetch.storage.manifest import Manifest
 from massive_fetch.transform.normalize import normalize
 
 _ASSET_CLASS = "crypto"
-_TIMEFRAME = "daily"
+
+# SPEC §7.1 / SDK_NOTES §3: list_aggs timespan tokens, keyed by our timeframe name.
+_TIMESPAN = {"daily": "day", "minute": "minute"}
 
 
 @dataclass(frozen=True)
@@ -73,19 +94,21 @@ def _next_day(iso_date: str) -> str:
     return (date.fromisoformat(iso_date) + timedelta(days=1)).isoformat()
 
 
-async def ingest_crypto_daily(
+async def ingest_crypto(
     *,
     config: AppConfig,
     backend: StorageBackend,
     manifest: Manifest,
     client: MassiveRESTClient,
     logger: structlog.stdlib.BoundLogger,
+    timeframe: str,  # "daily" | "minute"
     symbols: list[str] | None = None,
     start: str | None = None,
     end: str | None = None,
     dry_run: bool = False,
 ) -> CryptoIngestResult:
-    """Backfill/update crypto daily bars. See the module docstring."""
+    """Backfill/update crypto bars at ``timeframe``. See the module docstring."""
+    timespan = _TIMESPAN[timeframe]
     quote = config.ingest.crypto.quote_currency
     bare_symbols = symbols if symbols is not None else config.ingest.crypto.symbols
     default_start = start or config.defaults.crypto_start
@@ -98,11 +121,12 @@ async def ingest_crypto_daily(
     planned: list[tuple[str, AggsRequest]] = []  # (bare_symbol, request)
     for bare in bare_symbols:
         ticker = f"X:{bare}{quote}"  # Massive crypto ticker, e.g. X:BTCUSD (§5.3)
-        state = manifest.get_state(_ASSET_CLASS, ticker, _TIMEFRAME)
+        state = manifest.get_state(_ASSET_CLASS, ticker, timeframe)
         if state is not None and state["last_complete_date"] >= target_end:
             logger.info(
                 "ingest.skip_uptodate",
                 symbol=ticker,
+                timeframe=timeframe,
                 last_complete_date=state["last_complete_date"],
                 target_end=target_end,
             )
@@ -111,7 +135,7 @@ async def ingest_crypto_daily(
         # Resume from last_complete_date + 1 when a row exists (SPEC §6.3),
         # otherwise from the configured/explicit start.
         from_date = _next_day(state["last_complete_date"]) if state is not None else default_start
-        planned.append((bare, AggsRequest(ticker, 1, "day", from_date, target_end)))
+        planned.append((bare, AggsRequest(ticker, 1, timespan, from_date, target_end)))
         result.plan.append(SymbolPlan(ticker, from_date, target_end))
 
     if dry_run or not planned:
@@ -153,31 +177,95 @@ async def ingest_crypto_daily(
             continue
 
         df = normalize(bars, ticker)
-        key = paths.crypto_daily_key(bare)
-        backend.append_parquet(key, df, ["symbol", "timestamp"])
+        if timeframe == "daily":
+            total_bars = _write_and_record_daily(backend, manifest, bare, ticker, df)
+        else:
+            total_bars = _write_and_record_minute(backend, manifest, bare, ticker, df)
 
-        # Read the merged file back for authoritative manifest values, then record
-        # in a single transaction AFTER the Parquet commit (write-then-record, §8).
-        merged = backend.read_parquet(key)
-        _record_manifest(manifest, ticker, merged)
         result.succeeded.append(ticker)
         logger.info(
             "ingest.symbol_done",
             symbol=ticker,
+            timeframe=timeframe,
             bars_fetched=len(bars),
-            total_bars=merged.height,
-            key=key,
+            total_bars=total_bars,
         )
 
     return result
 
 
-def _record_manifest(manifest: Manifest, ticker: str, merged: pl.DataFrame) -> None:
+async def ingest_crypto_daily(
+    *,
+    config: AppConfig,
+    backend: StorageBackend,
+    manifest: Manifest,
+    client: MassiveRESTClient,
+    logger: structlog.stdlib.BoundLogger,
+    symbols: list[str] | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    dry_run: bool = False,
+) -> CryptoIngestResult:
+    """Backfill/update crypto **daily** bars (Slice 2 entry point, preserved)."""
+    return await ingest_crypto(
+        config=config,
+        backend=backend,
+        manifest=manifest,
+        client=client,
+        logger=logger,
+        timeframe="daily",
+        symbols=symbols,
+        start=start,
+        end=end,
+        dry_run=dry_run,
+    )
+
+
+def _write_and_record_daily(
+    backend: StorageBackend, manifest: Manifest, bare: str, ticker: str, df: pl.DataFrame
+) -> int:
+    """Append the full-history daily file, then record the manifest from it (§6, §8)."""
+    key = paths.crypto_daily_key(bare)
+    backend.append_parquet(key, df, ["symbol", "timestamp"])
+    merged = backend.read_parquet(key)
+    _record_manifest(manifest, ticker, "daily", merged)
+    return merged.height
+
+
+def _write_and_record_minute(
+    backend: StorageBackend, manifest: Manifest, bare: str, ticker: str, df: pl.DataFrame
+) -> int:
+    """Split one frame by UTC year, append each ``{YYYY}.parquet``, then record once.
+
+    Years are written in ascending order (deterministic). The normalized frame is
+    filtered per year — no year helper column is ever added, so each on-disk file
+    keeps the exact canonical §6.1 schema. The single manifest row is computed from
+    ALL of the symbol's year files (read back authoritatively, post-dedupe) and
+    upserted only after every year file is committed (write-then-record, SPEC §8).
+    """
+    years = sorted(df.get_column("timestamp").dt.year().unique().to_list())
+    for year in years:
+        year_df = df.filter(pl.col("timestamp").dt.year() == year)
+        backend.append_parquet(paths.crypto_minute_key(bare, year), year_df, ["symbol", "timestamp"])
+
+    # Read back every year file for this symbol — authoritative earliest/last/count
+    # across years (mirrors the daily read-back). The minute directory is derived
+    # from the key builder so storage/paths.py stays the single source of truth.
+    minute_dir = posixpath.dirname(paths.crypto_minute_key(bare, 0))
+    keys = backend.list_keys(minute_dir)
+    merged = pl.concat([backend.read_parquet(k) for k in keys])
+    _record_manifest(manifest, ticker, "minute", merged)
+    return merged.height
+
+
+def _record_manifest(
+    manifest: Manifest, ticker: str, timeframe: str, merged: pl.DataFrame
+) -> None:
     ts = merged.get_column("timestamp")
     manifest.upsert_state(
         _ASSET_CLASS,
         ticker,
-        _TIMEFRAME,
+        timeframe,
         earliest_date=ts.min().date().isoformat(),
         last_complete_date=ts.max().date().isoformat(),
         bar_count=merged.height,

@@ -460,4 +460,57 @@ Both are the only §6.1 changes; `normalize.py` enforces the amended schema down
 
 ---
 
+## Slice 3 — Crypto minute: resumability granularity & year-partitioning
+
+Slice 3 adds year-partitioned minute writes and proves resumability. One
+architectural question was settled with the outside reviewer before any code.
+
+**Decision: keep the manifest at DAY granularity (`last_complete_date`, ISO date) for
+minute data — no finer-grained (timestamp-level or per-year) progress tracking, no schema
+change.** Resume stays `last_complete_date + 1 day`, identical to Slice 2 daily and SPEC
+§6.3. Correctness rests on one invariant: *a day D is recorded as `last_complete_date` only
+when all of day D's minute bars are durably on disk.* Three properties preserve it: (1)
+`target_end` defaults to yesterday (UTC) — a complete past day — so the max-timestamp day in
+any fetch is always whole, never half-populated; (2) ingestion is single-shot (one
+`list_aggs` per symbol materializes the full page-walk into one frame) and each
+`{YYYY}.parquet` is written atomically (temp + `os.replace`); (3) write-then-record — the
+single manifest row is upserted only after every year file for the symbol is committed.
+Given the invariant, `+1 day` never skips an un-fetched bar (gap-free), and the one crash
+window — between the Parquet commit and the manifest upsert, where disk holds more than the
+manifest knows — is healed dupe-free on rerun because `append_parquet` dedupes on
+`(symbol, timestamp)` at nanosecond precision and the rerun re-fetches the overlap. A
+partial-last-day re-fetch was considered and rejected as unnecessary (it would also fork the
+minute path away from daily). The adversarial rigor went into deterministic tests rather than
+a finer manifest: a crash-injection test (raise after the parquet write, before the manifest
+upsert; rerun completes gap-free/dupe-free) and a year-boundary split test on a synthetic
+multi-year fixture.
+
+**Manifest update unit: once per symbol, after all year files.** A multi-year minute range
+returns as one frame, split by UTC year into N `{YYYY}.parquet` files (written ascending,
+deterministic). `earliest_date` / `last_complete_date` / `bar_count` are computed by reading
+back all of the symbol's year files (authoritative, post-dedupe), mirroring the daily
+read-back. Reading every year file each run is fine at the 2-symbol crypto scale but is
+O(total history) per run — flagged to switch to accumulate-during-write at Slice 6 (stocks
+minute, ~600 symbols).
+
+**Finding — 429 on a long single-shot minute pagination.** The literal SPEC §13 headline
+(`--start=2024-01-01` BTC minute) rate-limited the tier: the ~2.5yr pull, paginated at 50k
+bars/page, raised urllib3 `MaxRetryError('too many 429 error responses')` after the SDK
+exhausted retries (surfaced as `MassiveRetriesExhausted`). The per-symbol policy skipped and
+continued; single-shot meant nothing was written. The live acceptance therefore used a
+tier-aware substitute window (`--start=2026-05-25`, 4 days → 5758 bars →
+`crypto/minute/BTC/2026.parquet`); the three fixed properties (year file produced, rerun
+no-op, mid-year kill resume) are the deterministic bar and stay green regardless. Recorded in
+`SDK_NOTES.md` §11 as a Slice 6 windowing/pacing constraint.
+
+**Note — §8 short-circuit wording drift.** SPEC §8 step 3 phrases the skip as
+`last_complete_date >= target_end − 1 trading day`; the Slice 2 code (reused unchanged by the
+shared core) implements `last_complete_date >= target_end`. These differ at one boundary: when
+`last_complete_date == target_end − 1`, the SPEC would skip but the code re-fetches that day.
+Both are correct (no gaps/dupes); the code is simply stricter / less lazy about the no-op. The
+minute path reuses the existing check verbatim — not re-derived. Left as-is; reconcile the SPEC
+prose to the code in a later doc-sync.
+
+---
+
 End of design log.

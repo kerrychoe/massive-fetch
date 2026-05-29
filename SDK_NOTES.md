@@ -174,3 +174,25 @@ custom_json=None)`.
 - Futures (Slice 8): `list_futures_contracts`, **`list_futures_aggregates`** (futures
   bars use their *own* method — **not** `list_aggs`), plus products/quotes/trades/
   schedules. SPEC §7.1's single `list_aggs` covers stocks + crypto only.
+
+## 11. Plan-tier limits observed live  ⚠️ (history depth + rate limit)
+
+Verified against the live API key on this machine (Slice 2 daily acceptance 2026-05-26;
+Slice 3 minute acceptance 2026-05-29). These are *account/tier* limits (SPEC §16), not SDK
+bugs — the API silently returns a shorter window than requested, or rate-limits a large pull.
+
+- **History depth is capped, and minute is shorter than daily.** Daily history returns only
+  ~2 years regardless of `from_` / `--start` (Slice 2: exactly 730 daily bars, 2024-05-27 →
+  2026-05-26). **Minute** history is shorter still: a BTC minute request from 2024-01-01 only
+  began returning bars at `t ≈ 1731940800000` (~2024-11-18, ~18 months back). Assert bar
+  counts against "what the tier returns," never against the full requested range;
+  `earliest_date` in the manifest reflects the real earliest bar, not the requested start.
+- **A long single-shot minute pull trips the 429 rate limit.** The SDK auto-paginates one
+  `list_aggs` call (§2) into many 50k-bar pages; a ~2.5-year BTC minute pull issued enough
+  pages fast enough to raise urllib3 `MaxRetryError('too many 429 error responses')` after the
+  SDK's own `Retry-After`-aware retries (§7) were exhausted — mapped to `MassiveRetriesExhausted`.
+  A tight window (4 days → 5758 bars) succeeds cleanly. **Slice 6 constraint (stocks minute,
+  ~600 symbols × years):** long minute backfills must be *windowed* (e.g. per-year sub-ranges)
+  and/or *paced*, not issued as one open-ended range per symbol. The conservative
+  `max_concurrent_requests=3` default bounds cross-symbol fan-out but **not** the page rate
+  within a single symbol's pagination — which is what tripped the limit here.

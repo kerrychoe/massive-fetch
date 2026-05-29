@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from massive_fetch import __version__
 from massive_fetch.clients.rest import MassiveAuthError, MassiveRESTClient
 from massive_fetch.config import load_config
-from massive_fetch.ingest.crypto import CryptoIngestResult, ingest_crypto_daily
+from massive_fetch.ingest.crypto import CryptoIngestResult, ingest_crypto
 from massive_fetch.logging_setup import setup_logging
 from massive_fetch.storage import paths
 from massive_fetch.storage.backend import LocalBackend
@@ -106,7 +106,7 @@ app.add_typer(backfill_app, name="backfill")
 
 @backfill_app.command("crypto")
 def backfill_crypto(
-    timeframe: str = typer.Option("daily", "--timeframe", help="daily | minute (minute lands in Slice 3)."),
+    timeframe: str = typer.Option("daily", "--timeframe", help="daily | minute."),
     start: Optional[str] = typer.Option(None, "--start", help="YYYY-MM-DD; default config.defaults.crypto_start."),
     end: Optional[str] = typer.Option(None, "--end", help="YYYY-MM-DD; default yesterday (UTC)."),
     symbols: Optional[str] = typer.Option(None, "--symbols", help="Comma-separated bare symbols, e.g. BTC,ETH."),
@@ -115,12 +115,12 @@ def backfill_crypto(
     config: Optional[Path] = ConfigOption,
     verbose: bool = VerboseOption,
 ) -> None:
-    """Backfill crypto daily bars (SPEC §10.1, §13 Slice 2)."""
+    """Backfill crypto daily or minute bars (SPEC §10.1, §13 Slice 2–3)."""
     cfg = load_config(config)
 
-    if timeframe != "daily":
+    if timeframe not in ("daily", "minute"):
         typer.echo(
-            f"--timeframe={timeframe!r} is not available yet; crypto minute lands in Slice 3.",
+            f"--timeframe={timeframe!r} is invalid; expected 'daily' or 'minute'.",
             err=True,
         )
         raise typer.Exit(code=3)
@@ -149,12 +149,13 @@ def backfill_crypto(
 
     async def _run() -> CryptoIngestResult:
         async with MassiveRESTClient(api_key, cfg.api, log) as client:
-            return await ingest_crypto_daily(
+            return await ingest_crypto(
                 config=cfg,
                 backend=backend,
                 manifest=manifest,
                 client=client,
                 logger=log,
+                timeframe=timeframe,
                 symbols=bare,
                 start=start,
                 end=end,
@@ -176,7 +177,7 @@ def backfill_crypto(
         return
 
     typer.echo(
-        f"crypto daily: {len(result.succeeded)} updated, "
+        f"crypto {timeframe}: {len(result.succeeded)} updated, "
         f"{len(result.zero_bar)} no-data, "
         f"{len(result.skipped_uptodate)} up-to-date, "
         f"{len(result.skipped_error)} failed"
