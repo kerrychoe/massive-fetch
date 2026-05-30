@@ -593,4 +593,33 @@ pages preceded the parser design.
 
 ---
 
+## Doc-sync — reconcile SPEC prose to Slices 3–4 reality
+
+A behavior-free documentation pass (no source, no tests, no code touched). SPEC ←
+reality, one-way; the decisions were already settled here and are simply
+propagated into the SPEC's prose. The original Slice 3 and Slice 4 notes above are
+left as history. Three reconciliations, now applied:
+
+1. **516 ≠ "~600".** The §13 Slice 4 acceptance (the one *normative* count) was
+   rewritten drift-aware: "~516 unique tickers in the parquet today (S&P 500 ∪
+   NDX, current membership — drifts; the live smoke asserts a loose 450–650 band)"
+   — so membership drift never forces a re-sync. The three *illustrative* sample
+   counts were updated to ~516 for consistency (not contract): §5.1 frozen-YAML
+   comment (~600 → ~516), §9.2 validation-report sample (Symbols 612 → 516, with
+   Healthy 605 → 509 so Healthy + Warnings still sums to the total), and §10.3
+   status sample (612 → 516 tickers). README needed no change — its Slice 4
+   paragraph carries no count.
+
+2. **`--force` added to §10.1.** `reference update [--scope=…] [--force]`, with a
+   one-line note that `--force` bypasses the 7-day cache short-circuit.
+
+3. **§8 step-3 wording → matches code.** "Skip if `last_complete_date >=
+   target_end - 1 trading day`" → "Skip if `last_complete_date >= target_end`".
+   The code is authoritative (stricter; both correct) and was **not** touched.
+
+The three-item doc-sync backlog (Slice 3 §8 wording drift; Slice 4 "516 ≠ ~600"
+and "--force not in §10.1") is now **cleared**.
+
+---
+
 End of design log.

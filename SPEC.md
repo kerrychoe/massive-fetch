@@ -290,7 +290,7 @@ tickers:
   - AAPL
   - MSFT
   - GOOGL
-  # ... ~600 tickers
+  # ... ~516 tickers
 ```
 
 The frozen YAML is committed as a fallback, regenerated on every successful scrape. **The README must clearly state that this universe is "today's membership only" and creates survivorship bias.**
@@ -637,7 +637,7 @@ Each ingestion module follows the same shape:
 
 1. Load universe.
 2. For each instrument, query manifest to determine start date.
-3. Skip if `last_complete_date >= target_end - 1 trading day`.
+3. Skip if `last_complete_date >= target_end`.
 4. Fetch via REST client, paginated.
 5. Normalize to canonical schema (`transform/normalize.py`).
 6. **Append** to existing Parquet (read-merge-write — Parquet doesn't support true append; read existing, concat, dedupe, write back).
@@ -700,8 +700,8 @@ Validation runs in two contexts:
 # Validation Report — 2025-05-02 14:23 UTC
 
 ## Stocks (daily)
-- Symbols: 612
-- Healthy: 605
+- Symbols: 516
+- Healthy: 509
 - Warnings: 7
   - AMC: 3 missing trading days in 2024 (2024-01-15, 2024-02-19, 2024-09-02)
   - ...
@@ -723,8 +723,9 @@ massive-fetch init
     Creates {data_dir} structure, writes empty manifest.sqlite,
     optionally pulls reference data.
 
-massive-fetch reference update [--scope=all|stocks|futures]
+massive-fetch reference update [--scope=all|stocks|futures] [--force]
     Refreshes universe lists.
+    --force bypasses the 7-day cache short-circuit (forces a refresh).
     Stocks: scrapes Wikipedia, writes universe_stocks.parquet.
     Futures: discovers contracts via API, writes futures_contracts.parquet.
 
@@ -779,7 +780,7 @@ For each reference dataset, print a one-line summary including the age in days a
 
 ```
 Reference data:
-  Stocks universe       (SP500 ∪ NDX):  612 tickers   · refreshed 2 days ago    [OK]
+  Stocks universe       (SP500 ∪ NDX):  516 tickers   · refreshed 2 days ago    [OK]
   Futures contracts     (12 products):  84 contracts  · refreshed 5 days ago    [OK]
   Market calendar:                                    · refreshed 1 day ago     [OK]
   Splits:                                3,412 rows   · refreshed 1 day ago     [OK]
@@ -897,7 +898,7 @@ Each slice is independently testable and produces something demonstrable. Do not
 - [ ] Wikipedia scrape for SP500 + NDX.
 - [ ] Frozen YAML fallback.
 - [ ] `reference update` writes universe_stocks.parquet.
-- **Acceptance**: ~600 unique tickers in the parquet; rerun within 7 days uses cache.
+- **Acceptance**: ~516 unique tickers in the parquet today (S&P 500 ∪ NDX, current membership — drifts; the live smoke asserts a loose 450–650 band); rerun within 7 days uses cache.
 
 ### Slice 5 — Stocks daily ingestion
 - [ ] Loops over universe.
