@@ -513,4 +513,84 @@ prose to the code in a later doc-sync.
 
 ---
 
+## Slice 4 — Stocks reference data: Wikipedia discovery & the source-of-truth split
+
+Slice 4 is the first **non-ingestion** slice — it scrapes **Wikipedia**, not the Massive
+API. None of the ingestion machinery (SDK wrapper, `fetch_many`, `normalize`, `AggsRequest`,
+manifest resume/`ingestion_state`, `append_parquet`) is used. As with Slice 1's "SDK
+discovery precedes wrapper design" rule, a one-time live `pandas.read_html` dump of both
+pages preceded the parser design.
+
+**Discovery (captured live before any code):**
+- **S&P 500** (`/wiki/List_of_S%26P_500_companies`): `read_html` → **3 tables**. Constituents
+  = **table 0**, 503 rows, ticker column literally **`Symbol`**. Table 1 is the changes-log
+  (MultiIndex tuple columns `('Added','Ticker')`…); table 2 is nav cruft.
+- **Nasdaq-100** (`/wiki/Nasdaq-100`): `read_html` → **~20 tables** (count is volatile).
+  Constituents = **table 5**, 101 rows, ticker column literally **`Ticker`**. Table 6 is the
+  changes-log (MultiIndex). **The constituents index is not stable across edits.**
+- **Literal ticker form on the page is the DOT form:** SP500 shows `BRK.B`, `BF.B`; **zero**
+  dash forms on either page; NDX has no multi-class names today. Massive also uses the dot
+  form — so the page already matches Massive. Normalization (`strip().upper().replace("-",
+  ".")`) is idempotent and effectively a pass-through for present data; the dash→dot mapping
+  future-proofs against either rendering. The conversion direction (dash→dot) was confirmed
+  against captured reality, not assumed.
+- **Real dedup union today = 516** (SP500 503 ∪ NDX 101, overlap 88; NDX adds 13: ALNY, ARM,
+  ASML, CCEP, FER, INSM, MELI, MRVL, MSTR, PDD, SHOP, TRI, ZS).
+
+**Decisions (settled with the outside reviewer before code):**
+
+1. **Table selection by column signature, not fixed index** (the §16 fragility mitigation).
+   `select_constituents_table` returns the first table whose columns are all *flat strings*
+   (excludes the MultiIndex changes-log tables, which also carry a ticker column), that
+   contains the expected ticker column exactly, and has ≥50 rows. Tolerates the NDX index
+   drifting; a genuine restructure (no matching table) raises `ScrapeError` → frozen-YAML
+   fallback.
+
+2. **Source-of-truth split (§6.0.1).** The frozen YAML is **repo config**, written directly
+   to `config/universes/stocks_sp500_qqq.yaml`; the parquet is **data**, written via the
+   `StorageBackend` keyed by `paths.universe_stocks_key()`. No path logic against the data
+   dir lives outside `storage/`. The YAML is created on first successful scrape (no seed was
+   committed beforehand).
+
+3. **Universe parquet is a full snapshot, full-replaced every refresh** — written with
+   `write_parquet`, **never** `append_parquet`/`dedupe_on`. Append+dedupe is the daily/minute
+   *incremental* pattern and does not apply to a snapshot.
+
+4. **Vintage preservation on fallback (HARD CONSTRAINT, §10.3).** On a scrape failure the
+   parquet is written from the frozen YAML and stamped with the **YAML's** `generated_at`
+   (the data's true vintage), **never** `now()`. A scraper broken for weeks therefore reports
+   the old vintage, so §10.3 staleness detection correctly flags STALE instead of silently
+   "0 days ago" — the entire reason §10.3 exists. A dedicated unit test stamps the YAML ~30
+   days ago, fails the scrape, and asserts the resulting parquet reads back as STALE.
+
+5. **`generated_at` is a parquet column** (every row identical), not Arrow KV metadata. It
+   survives the parquet roundtrip, stays inside `write_parquet` without touching the
+   `StorageBackend` abstraction, and §10.3 reads it via `.max()`. On success the YAML and
+   parquet carry the *same* stamp (a single second-precision `now()`); they match exactly.
+
+6. **Freshness thresholds derive from the existing `ingest.stocks.refresh_interval_days`**
+   (×1 → OK, ×2 → WARN, beyond → STALE), **not** a new `StatusConfig`. The full §10.3 status
+   table (futures/calendar/splits/dividends) and `StatusConfig` are deferred with their
+   datasets (Slices 7–8); `reference/freshness.py` is built now (the 7-day cache short-circuit
+   needs it) and shaped so that table extends it later. The `status` command is **not** touched
+   this slice.
+
+7. **Live smoke calls raw `scrape()` directly**, not `update_stocks_universe`. Because the
+   fallback is graceful, a broken Wikipedia scrape would fall back to the frozen YAML, still
+   yield ~516 tickers, and pass a loose count check while the scraper is actually dead — the
+   exact §10.3 silent failure this slice exists to surface. Calling `scrape()` makes a
+   Wikipedia failure *raise*, so the smoke can't go green on a fallback.
+
+**Recorded for a later doc-sync** (same pass as the Slice 3 §8 wording drift):
+- **516 ≠ "~600".** SPEC §13/§10.3 say "~600"; today's real deduped union is **516**. The
+  "~600" figure is most likely the *un-deduped* 503 + ~100 ≈ 603. SPEC prose left unchanged
+  this slice; the live smoke asserts a loose **450–650** band so membership drift doesn't
+  break the gate, and the §13 acceptance text is kept verbatim.
+- **`--force` flag** on `reference update` is not in the §10.1 CLI signature. Added (bypasses
+  the 7-day cache short-circuit) and noted here for the doc-sync.
+
+`SDK_NOTES.md` is untouched — there is no SDK in this slice.
+
+---
+
 End of design log.

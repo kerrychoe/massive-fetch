@@ -13,6 +13,8 @@ dependencies = [
     "massive>=2.7.0,<3.0.0",
     "polars>=1.41.0",
     "pyarrow>=24.0.0",
+    "pandas>=2.2",
+    "lxml>=5.0",
 ]
 
 [project.scripts]

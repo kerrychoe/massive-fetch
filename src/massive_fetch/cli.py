@@ -20,6 +20,7 @@ from massive_fetch.clients.rest import MassiveAuthError, MassiveRESTClient
 from massive_fetch.config import load_config
 from massive_fetch.ingest.crypto import CryptoIngestResult, ingest_crypto
 from massive_fetch.logging_setup import setup_logging
+from massive_fetch.reference.universe import UniverseUnavailable, update_stocks_universe
 from massive_fetch.storage import paths
 from massive_fetch.storage.backend import LocalBackend
 from massive_fetch.storage.manifest import Manifest
@@ -94,6 +95,86 @@ def status(
     count = manifest.tracked_series_count()
     typer.echo(f"Tracked (symbol, timeframe) series: {count}")
     log.info("status.summary", tracked=count)
+
+
+reference_app = typer.Typer(
+    name="reference",
+    help="Refresh reference/universe data (SPEC §5, §10.1).",
+    no_args_is_help=True,
+)
+app.add_typer(reference_app, name="reference")
+
+
+@reference_app.command("update")
+def reference_update(
+    scope: str = typer.Option("all", "--scope", help="all | stocks | futures."),
+    force: bool = typer.Option(
+        False, "--force", help="Bypass the 7-day cache short-circuit and re-scrape."
+    ),
+    config: Optional[Path] = ConfigOption,
+    verbose: bool = VerboseOption,
+) -> None:
+    """Refresh universe lists (SPEC §10.1).
+
+    Stocks: scrapes Wikipedia (SP500 ∪ NDX), writes ``universe_stocks.parquet`` plus
+    the frozen-YAML fallback; a rerun within ``refresh_interval_days`` (7) uses the
+    cache. Futures contract discovery is Slice 8 — a no-op here.
+
+    ``--force`` is not in the SPEC §10.1 signature; it is documented in the DESIGN_LOG
+    Slice 4 entry pending a later doc-sync.
+    """
+    if scope not in ("all", "stocks", "futures"):
+        typer.echo(
+            f"--scope={scope!r} is invalid; expected 'all', 'stocks', or 'futures'.",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
+    cfg = load_config(config)
+    data_dir = cfg.storage.data_dir
+    logs_dir = data_dir / "logs"
+    log = setup_logging(
+        cfg.logging,
+        logs_dir=logs_dir if logs_dir.exists() else None,
+        verbose=verbose,
+    )
+
+    if scope in ("all", "stocks"):
+        backend = LocalBackend(
+            root=data_dir,
+            compression=cfg.storage.parquet_compression,
+            row_group_size=cfg.storage.parquet_row_group_size,
+        )
+        try:
+            result = update_stocks_universe(backend=backend, config=cfg, logger=log, force=force)
+        except UniverseUnavailable as exc:
+            typer.echo(f"Stocks universe unavailable: {exc}", err=True)
+            raise typer.Exit(code=2)
+
+        if result.cached:
+            typer.echo(
+                f"Stocks universe is fresh ({result.ticker_count} tickers, "
+                f"{result.generated_at:%Y-%m-%d}) — using cache, no scrape. "
+                f"Pass --force to refresh."
+            )
+        elif result.used_fallback:
+            typer.echo(
+                f"Wikipedia scrape failed — fell back to frozen YAML: "
+                f"{result.ticker_count} tickers (vintage {result.generated_at:%Y-%m-%d})."
+            )
+        else:
+            frozen = cfg.ingest.stocks.frozen_fallback_path
+            typer.echo(
+                f"Stocks universe updated: {result.ticker_count} tickers "
+                f"(SP500 ∪ NDX)\n"
+                f"  parquet: {paths.universe_stocks_key()}\n"
+                f"  frozen fallback: {frozen}"
+            )
+
+    if scope in ("all", "futures"):
+        # Futures contract discovery is Slice 8 (SPEC §5.2, §13). No-op for now.
+        typer.echo("Futures contract discovery is not implemented yet (Slice 8) — skipping.")
+        log.info("reference.futures.skipped_not_implemented")
 
 
 backfill_app = typer.Typer(
