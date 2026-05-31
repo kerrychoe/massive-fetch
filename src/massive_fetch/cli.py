@@ -18,9 +18,15 @@ from dotenv import load_dotenv
 from massive_fetch import __version__
 from massive_fetch.clients.rest import MassiveAuthError, MassiveRESTClient
 from massive_fetch.config import load_config
+from massive_fetch.ingest.base import IngestResult
 from massive_fetch.ingest.crypto import CryptoIngestResult, ingest_crypto
+from massive_fetch.ingest.stocks import ingest_stocks_daily
 from massive_fetch.logging_setup import setup_logging
-from massive_fetch.reference.universe import UniverseUnavailable, update_stocks_universe
+from massive_fetch.reference.universe import (
+    MissingUniverseError,
+    UniverseUnavailable,
+    update_stocks_universe,
+)
 from massive_fetch.storage import paths
 from massive_fetch.storage.backend import LocalBackend
 from massive_fetch.storage.manifest import Manifest
@@ -259,6 +265,99 @@ def backfill_crypto(
 
     typer.echo(
         f"crypto {timeframe}: {len(result.succeeded)} updated, "
+        f"{len(result.zero_bar)} no-data, "
+        f"{len(result.skipped_uptodate)} up-to-date, "
+        f"{len(result.skipped_error)} failed"
+    )
+    if result.exit_code != 0:
+        raise typer.Exit(code=result.exit_code)
+
+
+@backfill_app.command("stocks")
+def backfill_stocks(
+    timeframe: str = typer.Option("daily", "--timeframe", help="daily (minute is Slice 6)."),
+    start: Optional[str] = typer.Option(None, "--start", help="YYYY-MM-DD; default config.defaults.stocks_daily_start."),
+    end: Optional[str] = typer.Option(None, "--end", help="YYYY-MM-DD; default last complete NYSE session."),
+    symbols: Optional[str] = typer.Option(None, "--symbols", help="Comma-separated tickers, e.g. AAPL,MSFT. Default: the stocks universe."),
+    concurrency: Optional[int] = typer.Option(None, "--concurrency", help="Max concurrent requests; default from config."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the per-symbol fetch plan; make no API calls."),
+    config: Optional[Path] = ConfigOption,
+    verbose: bool = VerboseOption,
+) -> None:
+    """Backfill stocks daily bars for the universe (SPEC §10.1, §13 Slice 5)."""
+    cfg = load_config(config)
+
+    if timeframe != "daily":
+        typer.echo(
+            f"--timeframe={timeframe!r} is not available: stocks ingestion is daily only "
+            "(minute is Slice 6).",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+
+    data_dir = cfg.storage.data_dir
+    logs_dir = data_dir / "logs"
+    log = setup_logging(
+        cfg.logging,
+        logs_dir=logs_dir if logs_dir.exists() else None,
+        verbose=verbose,
+    )
+
+    if concurrency is not None:
+        cfg.api.max_concurrent_requests = concurrency
+
+    backend = LocalBackend(
+        root=data_dir,
+        compression=cfg.storage.parquet_compression,
+        row_group_size=cfg.storage.parquet_row_group_size,
+    )
+    manifest = Manifest(data_dir / paths.manifest_key())
+    manifest.initialize()  # idempotent; makes backfill safe even before `init`
+
+    # Normalize --symbols input here, where it belongs: upper-case (so a lower-case
+    # arg like brk.b matches the dot-form universe -> BRK.B) AND order-preserving
+    # de-dupe (so aapl,AAPL collapses to one) before handing a clean list to the
+    # entrypoint. Both are input normalization and live together.
+    tickers = (
+        list(dict.fromkeys(s.strip().upper() for s in symbols.split(",") if s.strip()))
+        if symbols
+        else None
+    )
+    api_key = os.getenv("MASSIVE_API_KEY")
+
+    async def _run() -> IngestResult:
+        async with MassiveRESTClient(api_key, cfg.api, log) as client:
+            return await ingest_stocks_daily(
+                config=cfg,
+                backend=backend,
+                manifest=manifest,
+                client=client,
+                logger=log,
+                symbols=tickers,
+                start=start,
+                end=end,
+                dry_run=dry_run,
+            )
+
+    try:
+        result = asyncio.run(_run())
+    except MissingUniverseError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=3)
+    except MassiveAuthError as exc:
+        typer.echo(f"Authentication failed (is MASSIVE_API_KEY set?): {exc}", err=True)
+        raise typer.Exit(code=3)
+
+    if result.dry_run:
+        typer.echo("Dry run — no API calls made.")
+        for sp in result.plan:
+            typer.echo(f"  would fetch {sp.ticker}: {sp.from_date} -> {sp.to_date}")
+        for ticker in result.skipped_uptodate:
+            typer.echo(f"  up to date, skip: {ticker}")
+        return
+
+    typer.echo(
+        f"stocks daily: {len(result.succeeded)} updated, "
         f"{len(result.zero_bar)} no-data, "
         f"{len(result.skipped_uptodate)} up-to-date, "
         f"{len(result.skipped_error)} failed"

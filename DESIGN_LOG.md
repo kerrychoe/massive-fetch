@@ -622,4 +622,71 @@ and "--force not in §10.1") is now **cleared**.
 
 ---
 
+## Slice 5 — Stocks daily ingestion: shared-core extraction + NYSE-calendar target_end
+
+Slice 5 is the first full-universe (~516 symbols) daily backfill and the first reuse of the
+crypto ingestion core for a second asset class. It shipped as two commits.
+
+**Decision (with outside reviewer): extract `ingest/base.py` and refactor crypto onto it
+(commit 1), then build stocks as a thin `AssetProfile` over it (commit 2).** SPEC §3 names
+`ingest/base.py` as the shared-plumbing seam. The crypto core was asset-agnostic except for
+five points, captured by `AssetProfile(asset_class, to_identifiers, daily_key, minute_key)`.
+Two independent reviews (a behavior-preservation pass on commit 1, a correctness pass on
+commit 2) plus the guardrail — the crypto unit suites pass UNCHANGED (`git diff --stat
+tests/unit/test_crypto_* == 0`) — gate the refactor. Rejected: reusing `crypto.py` directly
+(crypto-specific: `X:` ticker, UTC yesterday) and duplicating the core into `stocks.py` (two
+copies of subtle plumbing; futures would make a third — exactly what §3 prevents).
+
+**The S1 identifier contract (load-bearing; only the crypto suite guards it).**
+`to_identifiers(entry) -> (storage_symbol, api_ticker)`. The **api_ticker** threads every
+externally observable site — every `IngestResult` list, `SymbolPlan.ticker`, every `symbol=`
+log field, the manifest key (`get_state`/`upsert_state`), and the `symbol` column (the arg to
+`normalize`). The **storage_symbol** reaches exactly one place: the Parquet key builder. For
+crypto these differ (`BTC` vs `X:BTCUSD`), so a swap is visible in behavior and the crypto
+tests catch it; for stocks they are identical (`AAPL`), so a swap would be invisible to any
+stocks test. That asymmetry is why the crypto regression suite, run unedited, is the sole
+guard against an identifier swap in the shared core.
+
+**Calendar-aware `target_end` (stocks), reusing base's UTC date derivation.** Crypto resolves
+`target_end` to yesterday-UTC (24/7, no calendar); stocks resolve it to the last *complete*
+NYSE session via `reference/calendar.py::nyse_target_end` (last session on/before
+yesterday-ET; SPEC §2/§3 name `pandas_market_calendars` and the `reference/calendar.py`
+module). The shared core records `last_complete_date` from the UTC date of the max daily bar
+(`_record_manifest`'s `ts.max().date()`). **This reuse is valid because of the S6 probe
+(recorded in SDK_NOTES §11): RAW stock daily bars are stamped at midnight ET — 04:00Z EDT /
+05:00Z EST — so the bar's UTC date equals the ET session date**, and no ET-aware path is
+needed for daily. A plain "yesterday ET" target_end would have looped on weekends/holidays
+(the short-circuit `last_complete_date >= target_end` never engaging, re-fetching to zero
+bars); snapping to the last session fixes that. (Minute would need ET-awareness — Slice 6.)
+
+**RAW bars (`adjusted=false`).** Stocks inherit the `AggsRequest.adjusted=False` default
+(never overridden) per SPEC §6.1 — the store holds raw prices. Split/dividend adjustment is a
+read-time concern deferred to Slice 7; storing adjusted values would drift with every future
+corporate action.
+
+**AAPL acceptance: ±1 bar-count tolerance, EXACT start boundary [S8].** The §13 acceptance
+("spot-check AAPL bar count vs expected trading days") is checked against
+`nyse_session_count(earliest_stored, last_complete_date)` over the actually-stored range (per
+SDK_NOTES §11, "assert against what the tier returns"). The bar **count** allows a **±1**
+tolerance — a deliberate allowance for ad-hoc-closure encoding drift between the calendar lib
+and vendor data, matching the project's loose-band live-assertion precedent (Slice 4's
+450-650 universe band). The **start boundary stays EXACT**: a hard assertion that
+`earliest_stored == first NYSE session >= 2020-01-01`, which catches any silent tier clamping
+(the 2016-06-01 stocks-daily floor is well before 2020, so none is expected). The §13 prose
+is left verbatim; the ±1 tolerance lives here, not in SPEC.
+
+**`--symbols` dedup is CLI-layer input normalization; the core has none [2c].** The CLI
+upper-cases and order-preservingly de-dupes `--symbols` (`dict.fromkeys` over the upper-cased
+tokens) next to where it parses them, so `aapl,AAPL` collapses to one before
+`ingest_stocks_daily` is called. `fetch_many` keys results by ticker, so a duplicate
+api_ticker reaching `run_ingest` would be silently collapsed (later wins). Both production
+paths are dup-free: the CLI dedups, and the universe parquet is a `dedupe_union`'d set. A
+direct programmatic `ingest_stocks_daily(symbols=[dup])` can still pass a duplicate; it
+collapses harmlessly and the contract is documented ("callers pass a clean list"). The dedup
+was first placed (wrongly) *inside* the entrypoint, where a CLI-level test spying the
+entrypoint could not observe it; moving it to the CLI made the test assert the real contract
+(`captured["symbols"] == ["AAPL"]`) rather than a clean exit code.
+
+---
+
 End of design log.

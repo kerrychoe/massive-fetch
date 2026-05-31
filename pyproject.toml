@@ -15,6 +15,7 @@ dependencies = [
     "pyarrow>=24.0.0",
     "pandas>=2.2",
     "lxml>=5.0",
+    "pandas-market-calendars>=4.4",
 ]
 
 [project.scripts]

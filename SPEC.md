@@ -901,9 +901,9 @@ Each slice is independently testable and produces something demonstrable. Do not
 - **Acceptance**: ~516 unique tickers in the parquet today (S&P 500 ∪ NDX, current membership — drifts; the live smoke asserts a loose 450–650 band); rerun within 7 days uses cache.
 
 ### Slice 5 — Stocks daily ingestion
-- [ ] Loops over universe.
-- [ ] Concurrent fetch with semaphore.
-- [ ] Append-and-dedupe to per-symbol parquet.
+- [x] Loops over universe.
+- [x] Concurrent fetch with semaphore.
+- [x] Append-and-dedupe to per-symbol parquet.
 - **Acceptance**: backfill from 2020-01-01 for the universe completes; spot-check AAPL has correct bar count vs. expected trading days.
 
 ### Slice 6 — Stocks minute ingestion

@@ -196,3 +196,15 @@ bugs — the API silently returns a shorter window than requested, or rate-limit
   and/or *paced*, not issued as one open-ended range per symbol. The conservative
   `max_concurrent_requests=3` default bounds cross-symbol fan-out but **not** the page rate
   within a single symbol's pagination — which is what tripped the limit here.
+- **History depth is per-asset; the ~2yr daily cap above is CRYPTO daily, not a general
+  rule.** Stocks daily reaches ~10 years on this tier (Slice 5 probe, 2026-05-30): an AAPL
+  daily request from 2000-01-01 clamped to a **2016-06-01 floor** and returned **2513 bars**.
+  Record both separately — **crypto daily ~2yr · stocks daily ~10yr (2016-06-01 floor)**; do
+  not generalize crypto's cap across asset classes. The §13 Slice 5 window (start 2020-01-01)
+  is well inside the stocks floor, so no clamping occurs there.
+- **Stock daily-bar timestamp convention (S6 probe, 2026-05-30).** RAW AAPL daily bars are
+  stamped at **midnight ET in UTC** — `04:00:00Z` in EDT (2025-07-15 → `t=1752552000000`) and
+  `05:00:00Z` in EST (2025-01-15 → `t=1736917200000`). The bar's **UTC date equals the ET
+  session date** for daily, so the shared `_record_manifest` derivation (`ts.max().date()` on
+  the UTC timestamp) yields the correct session date with no ET-aware path. Daily only —
+  minute near the UTC-midnight boundary would need ET-awareness (Slice 6).

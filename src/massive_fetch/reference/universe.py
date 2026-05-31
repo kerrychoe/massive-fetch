@@ -94,6 +94,35 @@ class UniverseUnavailable(Exception):
     """Scrape failed **and** no frozen YAML exists — cannot produce a universe."""
 
 
+class MissingUniverseError(Exception):
+    """The stocks universe parquet is absent or empty when ingestion needs it."""
+
+
+def load_universe_tickers(backend: StorageBackend) -> list[str]:
+    """Return the stocks universe tickers for ingestion (SPEC §8.1).
+
+    Reads ``reference/universe_stocks.parquet`` (column ``ticker``, dot form e.g.
+    ``BRK.B`` — the Massive form). Raises :class:`MissingUniverseError` when the
+    parquet is **absent** OR present but holds **zero data rows**: an empty universe
+    must not silently ingest nothing. Build it first with
+    ``massive-fetch reference update --scope stocks``.
+    """
+    key = paths.universe_stocks_key()
+    if not backend.exists(key):
+        raise MissingUniverseError(
+            f"Stocks universe is missing ({key}). "
+            "Build it first: massive-fetch reference update --scope stocks"
+        )
+    df = backend.read_parquet(key)
+    tickers = df["ticker"].to_list() if "ticker" in df.columns else []
+    if not tickers:
+        raise MissingUniverseError(
+            f"Stocks universe is empty ({key}). "
+            "Rebuild it: massive-fetch reference update --scope stocks --force"
+        )
+    return tickers
+
+
 @dataclass
 class UniverseUpdateResult:
     """Outcome of :func:`update_stocks_universe`. Drives the CLI summary."""
